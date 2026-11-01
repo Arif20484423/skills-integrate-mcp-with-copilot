@@ -5,19 +5,69 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+import json
 import os
 from pathlib import Path
+
+from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from auth import (
+    SESSION_COOKIE_NAME,
+    SESSION_DURATION_SECONDS,
+    create_session,
+    get_current_teacher,
+    require_teacher,
+    verify_password,
+)
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
+teacher_credentials_path = Path(
+    os.environ.get("TEACHER_CREDENTIALS_FILE", current_dir / "teachers.json")
+)
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+
+class TeacherLogin(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+def load_teacher_credentials() -> list[dict[str, str]]:
+    if not teacher_credentials_path.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail="Teacher accounts are not configured. Run create_teacher.py first.",
+        )
+    try:
+        teachers = json.loads(teacher_credentials_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise HTTPException(
+            status_code=500, detail="Teacher credential file is invalid or unreadable."
+        ) from error
+    if not isinstance(teachers, list) or any(
+        not isinstance(teacher, dict)
+        or not isinstance(teacher.get("username"), str)
+        or not isinstance(teacher.get("password_hash"), str)
+        for teacher in teachers
+    ):
+        raise HTTPException(
+            status_code=500, detail="Teacher credential file has an invalid format."
+        )
+    if not teachers:
+        raise HTTPException(
+            status_code=503,
+            detail="No teacher accounts are configured. Run create_teacher.py first.",
+        )
+    return teachers
+
 
 # In-memory activity database
 activities = {
@@ -83,13 +133,60 @@ def root():
     return RedirectResponse(url="/static/index.html")
 
 
+@app.get("/auth/me")
+def get_auth_status(teacher: str | None = Depends(get_current_teacher)):
+    return {"authenticated": teacher is not None, "username": teacher}
+
+
+@app.post("/auth/login")
+def login(credentials: TeacherLogin, response: Response):
+    teachers = load_teacher_credentials()
+    teacher = next(
+        (
+            account
+            for account in teachers
+            if account["username"] == credentials.username
+        ),
+        None,
+    )
+    if teacher is None or not verify_password(
+        credentials.password, teacher["password_hash"]
+    ):
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=create_session(teacher["username"]),
+        max_age=SESSION_DURATION_SECONDS,
+        httponly=True,
+        secure=os.environ.get("COOKIE_SECURE", "false").lower() == "true",
+        samesite="strict",
+        path="/",
+    )
+    return {"username": teacher["username"]}
+
+
+@app.post("/auth/logout")
+def logout(response: Response):
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        httponly=True,
+        secure=os.environ.get("COOKIE_SECURE", "false").lower() == "true",
+        samesite="strict",
+        path="/",
+    )
+    return {"message": "Logged out"}
+
+
 @app.get("/activities")
 def get_activities():
     return activities
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str, email: str, _: str = Depends(require_teacher)
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +208,9 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str, email: str, _: str = Depends(require_teacher)
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
